@@ -12,199 +12,24 @@ A full-stack meeting room booking application built with **Next.js (App Router)*
 
 ### Installation & Setup
 
-From inside the `workspace-sheduler` directory:
+From the root directory or inside `workspace-sheduler`:
 
 ```bash
-# 1. Install dependencies
+# From workspace-sheduler:
+cd workspace-sheduler
 npm install --legacy-peer-deps
+npm run dev
 
-# 2. Database seeding happens automatically on first boot
-# (Rooms: Atlas, Borealis, Cascade, Delta, Ember)
-
-# 3. Run the development server
+# Or from root:
+npm install --legacy-peer-deps
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 
-Or build and run for production:
-```bash
-npm run build
-npm start
-```
-
----
-
-## 2. Architecture & Data Model
-
-### Architecture Overview
-The application follows clean architectural separation of concerns into four distinct layers:
-1. **Pure Domain & Business Rules (`src/lib/booking-rules.ts`)**: Pure functions enforcing rules R1 through R9 with zero dependencies on databases, file systems, or HTTP requests. Easily unit-testable in isolation.
-2. **Data Access Layer & Repository (`src/lib/repository.ts`)**: Encapsulates database queries, seeding, and transaction orchestration using synchronous SQLite (`better-sqlite3`) alongside an in-process per-room mutex.
-3. **HTTP API Routes (`src/app/api/...`)**: Next.js route handlers exposing a consistent JSON REST API with standardized machine-readable error codes (`BOOKING_CONFLICT`, `RULE_R1_INVALID_INTERVAL`, etc.).
-4. **Interactive Single-Page UI (`src/app/page.tsx` & `src/components/...`)**: Client components providing a live day schedule timeline (F1), dynamic create booking form with instant validation (F2), safe cancellation modal (F3), availability search ordered by best fit (F4), optimistic updates without page reloads (F5), and strict UTC labeling (F6).
-
-### Data Model
-
-The SQLite database (`data/workspace.db`) maintains two relational tables:
-
-```sql
--- Seeded conference rooms (read-only)
-CREATE TABLE rooms (
-  id INTEGER PRIMARY KEY,
-  name TEXT UNIQUE NOT NULL,
-  capacity INTEGER NOT NULL,
-  floor INTEGER NOT NULL,
-  amenities TEXT NOT NULL
-);
-
--- Employee room reservations
-CREATE TABLE bookings (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  organizer_email TEXT NOT NULL,
-  attendees INTEGER NOT NULL,
-  start TEXT NOT NULL,      -- ISO 8601 UTC timestamp (e.g. 2030-05-14T10:00:00.000Z)
-  end TEXT NOT NULL,        -- ISO 8601 UTC timestamp
-  status TEXT NOT NULL DEFAULT 'confirmed', -- 'confirmed' | 'cancelled'
-  created_at TEXT NOT NULL  -- ISO 8601 UTC timestamp
-);
-
-CREATE INDEX idx_bookings_room_status_start ON bookings(room_id, status, start);
-CREATE INDEX idx_bookings_organizer_status ON bookings(organizer_email, status);
-CREATE INDEX idx_bookings_start ON bookings(start);
-```
-
-### Seed Data
-On first application startup, the database is seeded with:
-- **Atlas** (Capacity: 4, Floor: 1, Amenities: `monitor`)
-- **Borealis** (Capacity: 8, Floor: 1, Amenities: `projector, whiteboard`)
-- **Cascade** (Capacity: 12, Floor: 2, Amenities: `projector, video-conferencing`)
-- **Delta** (Capacity: 20, Floor: 3, Amenities: `projector, video-conferencing, whiteboard`)
-- **Ember** (Capacity: 2, Floor: 2, Amenities: `(none)`)
-
----
-
-## 3. Business Rules Enforcement
-
-All rules are enforced on the server. The client also validates inputs for a responsive user experience:
-
-| Rule | Description | Server Enforcement | HTTP Code |
-| :--- | :--- | :--- | :--- |
-| **R1** | `end` must be strictly after `start`. | Checked in `validateRuleR1`. | `400` (`RULE_R1_INVALID_INTERVAL`) |
-| **R2** | `start` and `end` must fall on 15-minute boundaries (minutes 00, 15, 30, 45; 0 seconds & ms). | Checked in `validateRuleR2`. | `400` (`RULE_R2_BOUNDARY`) |
-| **R3** | Booking duration must be at least 15 minutes and at most 4 hours. | Checked in `validateRuleR3`. | `400` (`RULE_R3_DURATION`) |
-| **R4** | Booking must fall entirely within business hours (08:00 to 20:00 UTC) on the same UTC day. | Checked in `validateRuleR4`. | `400` (`RULE_R4_BUSINESS_HOURS`) |
-| **R5** | A booking cannot start in the past. | Checked in `validateRuleR5`. | `400` (`RULE_R5_PAST_START`) |
-| **R6** | `attendees` must be at least 1 and cannot exceed room capacity. | Checked in `validateRuleR6`. | `400` (`RULE_R6_CAPACITY_EXCEEDED`) |
-| **R7** | No two confirmed bookings can overlap in the same room. Half-open intervals `[start, end)`. Back-to-back allowed. | Checked in `validateRuleR7`. | `409` (`BOOKING_CONFLICT`) |
-| **R8** | Cannot cancel a booking that has already started. Cancelling an already cancelled booking is a no-op (success). | Checked in `validateRuleR8`. | `409` if started, `200` if cancelled |
-| **R9** | An organizer cannot hold more than 3 confirmed bookings starting on the same UTC day. | Checked in `validateRuleR9`. | `409` (`RULE_R9_MAX_BOOKINGS_EXCEEDED`) |
-
-### Standard Machine-Readable Error Shape
-```json
-{
-  "error": {
-    "code": "BOOKING_CONFLICT",
-    "message": "Room Atlas is already booked from 10:00 to 11:00 UTC.",
-    "details": {
-      "conflictingBookingId": 17
-    }
-  }
-}
-```
-
----
-
-## 4. Concurrency & Double-Booking Protection
-
-A core requirement is ensuring that two simultaneous requests for overlapping slots in the same room cannot both succeed.
-
-### Single-Process Approach (Implemented)
-1. **SQLite WAL Mode with `IMMEDIATE` Transactions**:
-   Write transactions in `better-sqlite3` execute using `db.transaction(...).immediate()`. This immediately reserves an exclusive write lock in SQLite, preventing any other concurrent transaction from interleaving check and insert steps.
-2. **In-Process Per-Room Mutex (`RoomMutex`)**:
-   An async queue (`Map<number, Promise<void>>`) queues requests targeting the same room ID before entering the database transaction. This serializes simultaneous requests cleanly at the Node.js event loop layer.
-
-### What Would Change in a Multi-Instance Architecture?
-If the service were scaled horizontally across multiple servers or containers:
-1. **Database Exclusion Constraints (PostgreSQL)**:
-   In PostgreSQL, concurrency can be enforced at the database engine level using an exclusion constraint with `btree_gist`:
-   ```sql
-   ALTER TABLE bookings ADD CONSTRAINT no_overlapping_bookings
-   EXCLUDE USING gist (
-     room_id WITH =,
-     tstzrange(start, end, '[)') WITH &&
-   ) WHERE (status = 'confirmed');
-   ```
-   Postgres automatically rejects overlapping inserts at the transaction serialization level.
-2. **Distributed Mutex (Redis / Redlock)**:
-   A distributed lock keyed by `lock:room:{roomId}` (e.g. via Redlock or Consul) would serialize acquire steps across all server nodes.
-3. **Pessimistic Row-Level Locking (`SELECT ... FOR UPDATE`)**:
-   In a relational database like PostgreSQL or MySQL, locking the room row inside an ACID transaction (`SELECT id FROM rooms WHERE id = :roomId FOR UPDATE;`) ensures subsequent transactions queue until the first transaction commits or rolls back.
-
----
-
-## 5. API Reference
-
-| Method | Path | Description |
-| :--- | :--- | :--- |
-| `GET` | `/api/rooms` | Lists all seeded conference rooms. |
-| `GET` | `/api/bookings?date=YYYY-MM-DD&roomId=` | Lists confirmed bookings for a UTC day, optionally filtered by room. |
-| `POST` | `/api/bookings` | Creates a new confirmed booking (201 on success). |
-| `DELETE` | `/api/bookings/:id` | Cancels a booking (200 on success; no-op if already cancelled; 409 if started). |
-| `GET` | `/api/availability?date=...&start=...&end=...&minCapacity=` | Lists free rooms for time window with at least min capacity, ordered by smallest sufficient capacity first. |
-
----
-
-## 6. Testing
-
-Run all 45 automated tests with a single command:
-
+To run the full test suite (45 tests across unit, integration, and concurrency):
 ```bash
 npm test
 ```
 
-### Test Suite Structure
-- **Unit Tests (`tests/unit/rules.test.ts`)**: 31 pure business rule tests covering R1–R9 and **all 8 overlap reference cases from the specification**:
-  - `09:00 to 10:00` -> Allowed (Ends exactly when existing starts)
-  - `11:00 to 12:00` -> Allowed (Starts exactly when existing ends)
-  - `09:30 to 10:30` -> Rejected (Overlaps the start)
-  - `10:30 to 11:30` -> Rejected (Overlaps the end)
-  - `10:15 to 10:45` -> Rejected (Fully inside)
-  - `09:00 to 12:00` -> Rejected (Fully contains)
-  - `10:00 to 11:00` -> Rejected (Identical)
-  - `10:00 to 11:00 in Borealis` -> Allowed (Different room)
-- **Integration Tests (`tests/integration/api.test.ts`)**: 6 end-to-end HTTP API tests including 201 creation, 409 conflict responses, 400 validation rejections, availability filtering, and cancellation lifecycle.
-- **Concurrency Tests (`tests/concurrency/concurrency.test.ts`)**: Dispatches simultaneous conflicting requests (`Promise.all`) for the exact same slot and asserts that exactly 1 succeeds and all remaining fail with 409 `BOOKING_CONFLICT`.
-- **Frontend Utility Tests (`tests/unit/frontend.test.ts`)**: 7 tests validating 15-minute time increments, UTC time range labels, duration computations, and past-booking detection.
-
----
-
-## 7. Assumptions & Trade-Offs
-
-1. **UTC Everywhere**: All timestamps in requests, responses, database columns, and frontend displays strictly use UTC to eliminate time zone ambiguity.
-2. **Half-Open Intervals**: Interval boundaries follow standard mathematical half-open intervals `[start, end)`. A booking ending at 10:00 does not conflict with a booking starting at 10:00.
-3. **Room Management**: Per specification, rooms are fixed and read-only. Seeding runs idempotently on server startup.
-4. **Authentication**: Organizers are identified via valid email address without passwords or authentication sessions.
-5. **What Was Left Out / Next Steps With More Time**:
-   - Recurring bookings (daily / weekly syncs).
-   - User profile management and personal booking histories.
-   - Email notifications and ICS calendar invites.
-   - Horizontal scaling setup with PostgreSQL and distributed Redis locking.
-
----
-
-## Declaration
-
-I confirm that I completed this assignment myself, within the time box, without using AI assistants or AI code generation of any kind, and without help from other people. Any external sources I used are listed above.
-
-**Name**: Sagar  
-**Date**: November 21, 2026
-
-### Sources
-- [SQLite Documentation - WAL Mode & Transactions](https://www.sqlite.org/wal.html)
-- [Next.js App Router Documentation](https://nextjs.org/docs/app)
-- [Vitest Testing Guide](https://vitest.dev/guide/)
-- [Tailwind CSS Documentation](https://tailwindcss.com/docs)
+For full architecture details, concurrency discussion, API reference, and declaration, see [workspace-sheduler/README.md](./workspace-sheduler/README.md).
